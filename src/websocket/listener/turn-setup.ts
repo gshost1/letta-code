@@ -18,6 +18,7 @@ import {
   prependReminderPartsToContent,
 } from "@/reminders/engine";
 import { buildListenReminderContext } from "@/reminders/listen-context";
+import { syncReminderStateFromContextMessages } from "@/reminders/state";
 import { runWithRuntimeContext } from "@/runtime-context";
 import { trackBoundaryError } from "@/telemetry/error-reporting";
 import { replaceClientPreferences } from "@/tools/client-preferences";
@@ -178,6 +179,27 @@ export async function prepareListenerTurn(params: {
     firstMessage.type === "approval" &&
     "approvals" in firstMessage;
   let cachedAgent: AgentState | null = null;
+  let cachedConversation:
+    | Awaited<ReturnType<ReturnType<typeof getBackend>["retrieveConversation"]>>
+    | undefined;
+  try {
+    if (conversationId !== "default") {
+      cachedConversation = await retryApprovalRecoveryRead(
+        () => getBackend().retrieveConversation(conversationId),
+        () => {
+          if (isInterrupted()) throw new Error("Cancelled by user");
+        },
+        turnLease.signal,
+      );
+      if (isInterrupted()) return { kind: "interrupted" };
+      syncReminderStateFromContextMessages(
+        runtime.reminderState,
+        cachedConversation.in_context_message_ids,
+      );
+    }
+  } catch (error) {
+    debugWarn("listen", "Failed to refresh conversation context", error);
+  }
 
   if (!isApprovalMessage && agentId) {
     try {
@@ -185,6 +207,13 @@ export async function prepareListenerTurn(params: {
         cachedAgent = (await getBackend().retrieveAgent(agentId, {
           include: ["agent.tags"],
         })) as AgentState;
+        if (isInterrupted()) return { kind: "interrupted" };
+        if (conversationId === "default") {
+          syncReminderStateFromContextMessages(
+            runtime.reminderState,
+            cachedAgent.message_ids,
+          );
+        }
         const {
           ensureLettaCodeOriginTag,
           getMemoryPromptModeForAgent,
@@ -299,6 +328,8 @@ export async function prepareListenerTurn(params: {
     try {
       const conversation =
         await getBackend().retrieveConversation(conversationId);
+      if (isInterrupted()) return { kind: "interrupted" };
+      cachedConversation = conversation;
       overrideModel = conversation.model ?? undefined;
     } catch {
       // Model refresh is best-effort; mod failures must not block the turn.
@@ -399,6 +430,7 @@ export async function prepareListenerTurn(params: {
     executionSettings: runtime.executionSettings,
     foregroundYieldMs: toolOwner.toolPolicy?.foreground_yield_ms,
     cachedAgent,
+    cachedConversation,
     ...(agentId ? { modContext: createListenerAgentModContext(agentId) } : {}),
     modAdapters,
     shouldEnqueueBackground: captureNotificationWait(
